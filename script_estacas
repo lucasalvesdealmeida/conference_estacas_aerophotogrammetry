@@ -1,0 +1,341 @@
+# ============================================================
+# ANÁLISE SfM — EXP2 — PONTUAL + REGRESSÕES + BOOTSTRAP (v2)
+# ============================================================
+
+# 0. SETUP ---------------------------------------------------
+while (sink.number() > 0) sink()
+
+# ---------- Pacotes: auto-instala o que faltar ----------
+pkgs <- c("here", "sf", "terra", "dplyr", "tidyr", "ggplot2",
+          "effsize", "rstatix", "openxlsx", "gridExtra", "scales")
+
+faltando <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(faltando) > 0) {
+  cat("Instalando pacotes faltantes:", paste(faltando, collapse = ", "), "\n")
+  install.packages(faltando, dependencies = TRUE)
+}
+suppressPackageStartupMessages(
+  invisible(lapply(pkgs, library, character.only = TRUE))
+)
+
+# ---------- Raiz do projeto (portátil) ----------
+BASE_DIR <- here::here()
+setwd(BASE_DIR)
+
+# Sanidade: precisamos estar na raiz correta (com .Rproj ou .here)
+tem_rproj <- length(list.files(BASE_DIR, pattern = "\\.Rproj$")) > 0
+tem_here  <- file.exists(file.path(BASE_DIR, ".here"))
+
+if (!tem_rproj && !tem_here) {
+  stop(
+    "Não encontrei um .Rproj nem um arquivo '.here' em:\n  ", BASE_DIR,
+    "\n\nAbra o arquivo 'PROJECT_R_ESTACAS_SFM.Rproj' no RStudio ",
+    "(duplo clique) antes de rodar o script.\n",
+    "Sem isso, os caminhos relativos (here) ficam incorretos."
+  )
+}
+
+# Estrutura mínima esperada
+if (!dir.exists(here("DADOS"))) {
+  stop(
+    "Pasta 'DADOS' não encontrada em ", BASE_DIR,
+    "\nCopie a pasta do projeto INTEIRA ",
+    "(PROJECT_R_ESTACAS_SFM/ com DADOS/, RESULTADOS/, etc.), ",
+    "não apenas o arquivo .R."
+  )
+}
+
+RESULTADOS_DIR <- here("RESULTADOS")
+dir.create(RESULTADOS_DIR, recursive = TRUE, showWarnings = FALSE)
+
+GRAF_DIR <- here("RESULTADOS", "graficos_bootstrap")
+dir.create(GRAF_DIR, recursive = TRUE, showWarnings = FALSE)
+
+log_file <- here("RESULTADOS", "console_output_completo.txt")
+sink(log_file, split = TRUE)
+
+cat("============================================================\n")
+cat("ANÁLISE SfM — EXP2 (COMPLETA) — Iniciado em:", format(Sys.time()), "\n")
+cat("BASE_DIR :", BASE_DIR, "\n")
+cat("Rproj ok :", tem_rproj, " | .here ok :", tem_here, "\n")
+cat("============================================================\n\n")
+# 1. PACOTES -------------------------------------------------
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(effsize)
+  library(rstatix)
+  library(openxlsx)
+  library(gridExtra)
+  library(scales)
+})
+
+set.seed(2026)
+
+# 2. CONFIGURAÇÃO E DADOS ------------------------------------
+shp_exp2 <- here("DADOS", "EXP2", "SHAPEFILE",
+                 "pontos_base_conferencia_exp2.shp")
+
+caminhos <- list(
+  "100" = list(
+    shp = shp_exp2,
+    dsm = here("DADOS", "EXP2", "100m",
+               "DSM_RGB_DJI_202606021057_001_exp2-100m-agl-02jun26.tif"),
+    dem = here("DADOS", "EXP2", "coleta0",
+               "DEM_4-04-10-30_RGB_DJI_202512111145_007_exp2-100m-agl-2026_normal_com_nuvens.tif"),
+    gsd = 0.0630
+  ),
+  "70" = list(
+    shp = shp_exp2,
+    dsm = here("DADOS", "EXP2", "70m",
+               "DSM_DJI_202606021057_002_exp2-70m-agl-02jun26.tif"),
+    dem = here("DADOS", "EXP2", "coleta0",
+               "DEM_4-04-10-30_RGB_DJI_202512111145_007_exp2-100m-agl-2026_normal_com_nuvens.tif"),
+    gsd = 0.0466
+  ),
+  "50" = list(
+    shp = shp_exp2,
+    dsm = here("DADOS", "EXP2", "50m",
+               "DSM_DJI_202606021057_003_exp2-50m-agl-02jun26.tif"),
+    dem = here("DADOS", "EXP2", "coleta0",
+               "DEM_4-04-10-30_RGB_DJI_202512111145_007_exp2-100m-agl-2026_normal_com_nuvens.tif"),
+    gsd = 0.0331
+  )
+)
+
+metodo_extracao <- "single"
+buf_m           <- 0.15
+col_id          <- "id"
+col_tipo        <- "tipo"
+limiar_outlier  <- 50
+
+# 3. FUNÇÕES AUXILIARES --------------------------------------
+carregar_pts <- function(cfg, col_id, col_tipo) {
+  pts <- st_read(cfg$shp, quiet = TRUE)
+  if (!col_id %in% names(pts)) pts[[col_id]] <- seq_len(nrow(pts))
+  if (!col_tipo %in% names(pts)) stop("Coluna '", col_tipo, "' ausente.")
+  pts
+}
+
+extrair_alturas <- function(cfg, altitude, metodo = "single", buf_m = 0.15,
+                            col_id = "id", col_tipo = "tipo") {
+  pts <- carregar_pts(cfg, col_id, col_tipo)
+  dsm <- terra::rast(cfg$dsm); dem <- terra::rast(cfg$dem)
+  if (st_crs(pts) != crs(dsm)) pts <- st_transform(pts, crs(dsm))
+  
+  ids <- pts[[col_id]]
+  tipo_val <- suppressWarnings(as.numeric(as.character(pts[[col_tipo]])))
+  n <- length(ids)
+  
+  if (metodo == "single") {
+    pts_v <- terra::vect(pts)
+    v_dsm <- terra::extract(dsm, pts_v, ID = FALSE)
+    v_dem <- terra::extract(dem, pts_v, ID = FALSE)
+    z_dsm <- if (is.data.frame(v_dsm)) v_dsm[[ncol(v_dsm)]] else as.numeric(v_dsm)
+    z_dem <- if (is.data.frame(v_dem)) v_dem[[ncol(v_dem)]] else as.numeric(v_dem)
+  } else {
+    buf_sf <- st_buffer(pts, dist = buf_m)
+    buf_v  <- terra::vect(buf_sf)
+    z_dsm <- terra::extract(dsm, buf_v, fun = max, na.rm = TRUE, ID = FALSE)[, 1]
+    z_dem <- terra::extract(dem, buf_v, fun = min, na.rm = TRUE, ID = FALSE)[, 1]
+  }
+  
+  data.frame(
+    id_estaca = ids, altitude = as.numeric(altitude), tipo_cm = tipo_val,
+    z_dsm = z_dsm, z_dem = z_dem, altura_sfm = z_dsm - z_dem,
+    altura_nominal = tipo_val / 100
+  )
+}
+
+# 4. EXTRAÇÃO E OUTLIERS -------------------------------------
+dados <- bind_rows(lapply(names(caminhos), function(alt) {
+  extrair_alturas(caminhos[[alt]], altitude = as.numeric(alt),
+                  metodo = metodo_extracao, buf_m = buf_m,
+                  col_id = col_id, col_tipo = col_tipo)
+}))
+
+dados <- dados %>%
+  mutate(
+    erro_abs = altura_sfm - altura_nominal,
+    erro_rel = 100 * erro_abs / altura_nominal,
+    outlier  = abs(erro_rel) > limiar_outlier
+  )
+
+dados_desc <- dados %>% filter(!outlier)
+
+# 5. DESCRITIVAS E TESTES ORIGINAIS --------------------------
+descritivas <- dados_desc %>%
+  group_by(altitude) %>%
+  summarise(
+    n = n(), RMSE = sqrt(mean(erro_abs^2)), MAE = mean(abs(erro_abs)),
+    bias = mean(erro_abs), DP_erro = sd(erro_abs), erro_rel_medio = mean(erro_rel),
+    .groups = "drop"
+  ) %>%
+  mutate(GSD_cm_px = sapply(altitude, function(a) caminhos[[as.character(a)]]$gsd))
+
+cat("\n=== TABELA 1: DESCRITIVAS (PONTO EXATO) ===\n")
+print(descritivas, digits = 4)
+
+# 6. CORRELAÇÕES E REGRESSÕES (DADOS ORIGINAIS) -------
+cat("\n============================================================\n")
+cat("CORRELAÇÕES E REGRESSÕES (DADOS ORIGINAIS)\n")
+cat("============================================================\n")
+
+metricas_regressao <- dados_desc %>%
+  group_by(altitude) %>%
+  summarise(
+    Pearson_r = cor(altura_nominal, altura_sfm, method = "pearson"),
+    Pearson_p = cor.test(altura_nominal, altura_sfm, method = "pearson")$p.value,
+    # Adicionado exact = FALSE para evitar warning de empates no Spearman
+    Spearman_rho = cor(altura_nominal, altura_sfm, method = "spearman"),
+    Spearman_p = cor.test(altura_nominal, altura_sfm, method = "spearman", exact = FALSE)$p.value,
+    R2_linear = summary(lm(altura_nominal ~ altura_sfm))$r.squared,
+    R2_ajustado_linear = summary(lm(altura_nominal ~ altura_sfm))$adj.r.squared,
+    R2_poly2 = summary(lm(altura_nominal ~ poly(altura_sfm, 2, raw = TRUE)))$r.squared,
+    R2_ajustado_poly2 = summary(lm(altura_nominal ~ poly(altura_sfm, 2, raw = TRUE)))$adj.r.squared,
+    .groups = "drop"
+  )
+print(metricas_regressao, digits = 4)
+
+# 7. BOOTSTRAP PAREADO (10.000 iterações) --------------------
+cat("\n============================================================\n")
+cat("BOOTSTRAP (10.000 iterações) - Linear e Polinomial\n")
+cat("============================================================\n")
+
+calc_boot_metrics <- function(data, R = 10000) {
+  n <- nrow(data)
+  res_lin <- data.frame(intercepto = numeric(R), beta1 = numeric(R), r2 = numeric(R), rmse = numeric(R))
+  res_poly <- data.frame(intercepto = numeric(R), beta1 = numeric(R), beta2 = numeric(R), r2 = numeric(R), rmse = numeric(R))
+  
+  for (i in 1:R) {
+    idx <- sample(1:n, n, replace = TRUE)
+    d_boot <- data[idx, ]
+    
+    # Checagem: se todos os X forem iguais, a variância é 0 e o lm vai falhar
+    if (var(d_boot$altura_sfm) == 0) {
+      res_lin[i, ] <- NA
+      res_poly[i, ] <- NA
+      next # Pula para a próxima iteração
+    }
+    
+    # Modelo Linear
+    mod_lin <- lm(altura_nominal ~ altura_sfm, data = d_boot)
+    res_lin$intercepto[i] <- coef(mod_lin)[1]
+    res_lin$beta1[i] <- coef(mod_lin)[2]
+    res_lin$r2[i] <- summary(mod_lin)$r.squared
+    res_lin$rmse[i] <- sqrt(mean(resid(mod_lin)^2))
+    
+    # Modelo Polinomial (Grau 2)
+    mod_poly <- lm(altura_nominal ~ poly(altura_sfm, 2, raw = TRUE), data = d_boot)
+    res_poly$intercepto[i] <- coef(mod_poly)[1]
+    res_poly$beta1[i] <- coef(mod_poly)[2]
+    res_poly$beta2[i] <- coef(mod_poly)[3]
+    res_poly$r2[i] <- summary(mod_poly)$r.squared
+    res_poly$rmse[i] <- sqrt(mean(resid(mod_poly)^2))
+  }
+  return(list(linear = res_lin, poly = res_poly))
+}
+
+altitudes <- unique(dados_desc$altitude)
+boot_results <- list()
+
+for (alt in altitudes) {
+  cat("Processando bootstrap para", alt, "m...\n")
+  d_alt <- dados_desc %>% filter(altitude == alt)
+  boot_results[[as.character(alt)]] <- calc_boot_metrics(d_alt, R = 10000)
+}
+
+# Resumo dos resultados (Adicionado na.rm = TRUE em tudo)
+resumo_boot_lin <- bind_rows(lapply(names(boot_results), function(alt) {
+  df <- boot_results[[alt]]$linear
+  data.frame(
+    altitude = as.numeric(alt),
+    Parametro = c("Intercepto", "Slope (beta1)", "R2", "RMSE"),
+    Media = c(mean(df$intercepto, na.rm=TRUE), mean(df$beta1, na.rm=TRUE), mean(df$r2, na.rm=TRUE), mean(df$rmse, na.rm=TRUE)),
+    SD = c(sd(df$intercepto, na.rm=TRUE), sd(df$beta1, na.rm=TRUE), sd(df$r2, na.rm=TRUE), sd(df$rmse, na.rm=TRUE)),
+    IC_2.5 = c(quantile(df$intercepto, 0.025, na.rm=TRUE), quantile(df$beta1, 0.025, na.rm=TRUE), quantile(df$r2, 0.025, na.rm=TRUE), quantile(df$rmse, 0.025, na.rm=TRUE)),
+    IC_97.5 = c(quantile(df$intercepto, 0.975, na.rm=TRUE), quantile(df$beta1, 0.975, na.rm=TRUE), quantile(df$r2, 0.975, na.rm=TRUE), quantile(df$rmse, 0.975, na.rm=TRUE))
+  )
+}))
+
+resumo_boot_poly <- bind_rows(lapply(names(boot_results), function(alt) {
+  df <- boot_results[[alt]]$poly
+  data.frame(
+    altitude = as.numeric(alt),
+    Parametro = c("Intercepto", "Beta1", "Beta2", "R2", "RMSE"),
+    Media = c(mean(df$intercepto, na.rm=TRUE), mean(df$beta1, na.rm=TRUE), mean(df$beta2, na.rm=TRUE), mean(df$r2, na.rm=TRUE), mean(df$rmse, na.rm=TRUE)),
+    SD = c(sd(df$intercepto, na.rm=TRUE), sd(df$beta1, na.rm=TRUE), sd(df$beta2, na.rm=TRUE), sd(df$r2, na.rm=TRUE), sd(df$rmse, na.rm=TRUE)),
+    IC_2.5 = c(quantile(df$intercepto, 0.025, na.rm=TRUE), quantile(df$beta1, 0.025, na.rm=TRUE), quantile(df$beta2, 0.025, na.rm=TRUE), quantile(df$r2, 0.025, na.rm=TRUE), quantile(df$rmse, 0.025, na.rm=TRUE)),
+    IC_97.5 = c(quantile(df$intercepto, 0.975, na.rm=TRUE), quantile(df$beta1, 0.975, na.rm=TRUE), quantile(df$beta2, 0.975, na.rm=TRUE), quantile(df$r2, 0.975, na.rm=TRUE), quantile(df$rmse, 0.975, na.rm=TRUE))
+  )
+}))
+
+cat("\n=== BOOTSTRAP LINEAR (Resumo) ===\n"); print(resumo_boot_lin, digits = 4)
+cat("\n=== BOOTSTRAP POLINOMIAL (Resumo) ===\n"); print(resumo_boot_poly, digits = 4)
+
+# 8. GRÁFICOS DO BOOTSTRAP --------------------------------
+for (alt in names(boot_results)) {
+  # Remove NAs para evitar erro nas funções hist, density e plot
+  df_lin <- boot_results[[alt]]$linear %>% filter(!is.na(r2) & !is.na(beta1) & !is.na(intercepto))
+  df_poly <- boot_results[[alt]]$poly %>% filter(!is.na(r2) & !is.na(beta1) & !is.na(beta2) & !is.na(intercepto))
+  d_orig <- dados_desc %>% filter(altitude == as.numeric(alt))
+  
+  # HISTOGRAMAS E DENSIDADES (Linear)
+  png(file.path(GRAF_DIR, paste0("hist_r2_linear_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  hist(df_lin$r2, breaks = 50, main = paste("Bootstrap R² Linear -", alt, "m"), xlab = "R²", col = "lightblue", border = "white"); dev.off()
+  
+  png(file.path(GRAF_DIR, paste0("hist_slope_linear_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  hist(df_lin$beta1, breaks = 50, main = paste("Bootstrap Slope Linear -", alt, "m"), xlab = "Beta", col = "lightgreen", border = "white"); dev.off()
+  
+  png(file.path(GRAF_DIR, paste0("densidade_r2_linear_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  plot(density(df_lin$r2), main = paste("Densidade R² Linear -", alt, "m"), xlab = "R²", lwd = 3, col = "darkblue"); dev.off()
+  
+  # HISTOGRAMAS E DENSIDADES (Polinomial)
+  png(file.path(GRAF_DIR, paste0("hist_r2_poly_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  hist(df_poly$r2, breaks = 50, main = paste("Bootstrap R² Polinomial -", alt, "m"), xlab = "R²", col = "salmon", border = "white"); dev.off()
+  
+  png(file.path(GRAF_DIR, paste0("densidade_r2_poly_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  plot(density(df_poly$r2), main = paste("Densidade R² Polinomial -", alt, "m"), xlab = "R²", lwd = 3, col = "darkred"); dev.off()
+  
+  # GRÁFICO DE REGRESSÃO
+  png(file.path(GRAF_DIR, paste0("regressao_bootstrap_", alt, "m.png")), width = 2000, height = 1500, res = 300)
+  
+  plot(d_orig$altura_sfm, d_orig$altura_nominal, pch = 16, cex = 1.5, 
+       xlab = "Altura Estimada (SfM)", ylab = "Altura Nominal (Real)", 
+       main = paste("Regressões Bootstrap -", alt, "m"), 
+       xlim = c(min(d_orig$altura_sfm)*0.8, max(d_orig$altura_sfm)*1.2),
+       ylim = c(min(d_orig$altura_nominal)*0.8, max(d_orig$altura_nominal)*1.2))
+  
+  abline(a = mean(df_lin$intercepto), b = mean(df_lin$beta1), col = "blue", lwd = 3, lty = 2)
+  
+  x_seq <- seq(min(d_orig$altura_sfm), max(d_orig$altura_sfm), length.out = 100)
+  y_poly <- mean(df_poly$intercepto) + mean(df_poly$beta1)*x_seq + mean(df_poly$beta2)*(x_seq^2)
+  lines(x_seq, y_poly, col = "red", lwd = 3, lty = 1)
+  
+  legend("topleft", legend = c("Linear (Média)", "Polinomial (Média)"),
+         col = c("blue", "red"), lwd = 3, lty = c(2, 1), bty = "n")
+  dev.off()
+}
+
+cat("\n✅ Todos os gráficos bootstrap foram salvos na pasta:", GRAF_DIR, "\n")
+
+# 9. EXPORTAÇÃO ---------------------------------------------
+wb <- createWorkbook()
+addWorksheet(wb, "Dados_brutos");    writeData(wb, "Dados_brutos", dados)
+addWorksheet(wb, "Descritivas");     writeData(wb, "Descritivas", descritivas)
+addWorksheet(wb, "Metricas_Reg");    writeData(wb, "Metricas_Reg", metricas_regressao)
+addWorksheet(wb, "Boot_Lin_Resumo"); writeData(wb, "Boot_Lin_Resumo", resumo_boot_lin)
+addWorksheet(wb, "Boot_Poly_Resumo");writeData(wb, "Boot_Poly_Resumo", resumo_boot_poly)
+
+saveWorkbook(wb, file.path(RESULTADOS_DIR, "resultados_sfm_completo.xlsx"), overwrite = TRUE)
+
+cat("\n✅ Planilha final exportada em:", RESULTADOS_DIR, "\n")
+cat("============================================================\n")
+cat("ANÁLISE CONCLUÍDA em:", format(Sys.time()), "\n")
+cat("============================================================\n")
+
+sink()
+
